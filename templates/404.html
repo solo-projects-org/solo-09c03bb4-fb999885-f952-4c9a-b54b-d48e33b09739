@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}找不到页面 · 分期分流核验{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>找不到页面</h1>
+  <p>请求的期次或地址不存在。<a href="{{ url_for('index') }}">返回总览</a></p>
+</section>
+{% endblock %}

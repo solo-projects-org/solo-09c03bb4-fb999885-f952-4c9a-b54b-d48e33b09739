@@ -1,0 +1,26 @@
+services:
+  split-verify:
+    build: .
+    image: split-verify:local
+    container_name: split-verify
+    ports:
+      - "8000:8000"
+    environment:
+      DIV_DB: /data/split.sqlite3
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+    volumes:
+      - split-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  split-data:

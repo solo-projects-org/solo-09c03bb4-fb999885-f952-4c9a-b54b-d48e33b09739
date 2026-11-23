@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}计划设置 · 分期分流核验{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>计划设置</h1>
+  {% if locked %}
+    <p class="banner pending">本轮已有上传或核验结果，计划已锁定。重置本轮数据后可重新设置比例。</p>
+  {% else %}
+    <p class="muted">开轮时固定各期应到人数与每人独立分到 B 组的概率，合计须为 {{ total_users }} 人。</p>
+  {% endif %}
+
+  {% if existing and existing | length %}
+    <h2>当前计划（{{ periods }} 期）</h2>
+    <table class="grid">
+      <thead><tr><th>期次</th><th>应到人数</th><th>B 组概率</th></tr></thead>
+      <tbody>
+        {% for row in existing %}
+          <tr>
+            <td>第 {{ row.period }} 期</td>
+            <td class="num">{{ row.planned_users }}</td>
+            <td class="num">{{ row.prob_b | prob }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted">合计 {{ existing | sum(attribute='planned_users') }} 人。</p>
+  {% endif %}
+
+  {% if not locked %}
+    <form method="post" action="{{ url_for('plan') }}" class="plan-form">
+      <label>
+        期数
+        <select name="periods" id="periods">
+          {% for n in range(1, max_periods + 1) %}
+            <option value="{{ n }}" {% if n == periods %}selected{% endif %}>{{ n }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <table class="grid" id="plan-rows">
+        <thead><tr><th>期次</th><th>应到人数</th><th>B 组概率</th></tr></thead>
+        <tbody>
+          {% for n in range(1, max_periods + 1) %}
+            {% set current = existing[n - 1] if existing and existing | length >= n else none %}
+            {% set posted = form.get('count_' ~ n) if form else none %}
+            {% set posted_prob = form.get('prob_' ~ n) if form else none %}
+            <tr data-period="{{ n }}">
+              <td>第 {{ n }} 期</td>
+              <td><input type="number" min="1" max="{{ total_users }}" name="count_{{ n }}" value="{{ posted if posted is not none else (current.planned_users if current else '') }}"></td>
+              <td><input type="text" inputmode="decimal" name="prob_{{ n }}" placeholder="0.5" value="{{ posted_prob if posted_prob is not none else (current.prob_b if current else '') }}"></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="muted" id="sum-note">各期人数合计须为 {{ total_users }}。只填写前「期数」行。</p>
+      <button type="submit" class="button">固定计划</button>
+    </form>
+
+    <script>
+      (function () {
+        const select = document.getElementById('periods');
+        const rows = Array.from(document.querySelectorAll('#plan-rows tbody tr'));
+        function sync() {
+          const n = parseInt(select.value, 10);
+          rows.forEach((row, index) => {
+            const active = index < n;
+            row.style.display = active ? '' : 'none';
+            row.querySelectorAll('input').forEach(input => { input.disabled = !active; });
+          });
+        }
+        select.addEventListener('change', sync);
+        sync();
+      })();
+    </script>
+  {% endif %}
+</section>
+
+{% if locked %}
+<section class="card">
+  <h1>重置本轮</h1>
+  <p class="muted">清空已接收明细与核验结果，保留计划；之后可重新调整比例。此操作不可撤销。</p>
+  <form method="post" action="{{ url_for('reset_round') }}" class="inline-form">
+    <label>输入 <code>RESET</code> 确认 <input type="text" name="confirm" autocomplete="off"></label>
+    <button type="submit" class="button danger">清空明细</button>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

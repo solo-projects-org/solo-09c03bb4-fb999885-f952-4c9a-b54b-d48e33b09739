@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}第 {{ period_no }} 期 · 分期分流核验{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="row">
+    <div>
+      <h1>第 {{ period_no }} 期</h1>
+      <p class="muted">
+        计划 {{ plan_row.planned_users }} 人；本期 B 组概率 {{ plan_row.prob_b | prob }}；
+        截至本期累计分布 = 第 1–{{ period_no }} 期各自二项分布的卷积。
+      </p>
+    </div>
+    <div class="actions"><a class="button secondary" href="{{ url_for('index') }}">返回总览</a></div>
+  </div>
+
+  <div class="upload-box">
+    <h2>上传本期明细</h2>
+    <p class="muted">CSV 需含用户编号与组别两列（A/B）；人数须等于 {{ plan_row.planned_users }}，用户编号全程唯一。</p>
+    <form method="post" enctype="multipart/form-data" class="inline-form">
+      <input type="file" name="file" accept=".csv,text/csv">
+      <button type="submit" class="button">上传核验</button>
+    </form>
+    {% if upload %}
+      <p class="muted">
+        已接收 {{ upload.row_count }} 人，其中 B 组 {{ upload.b_count }} 人；
+        接收时间 {{ upload.accepted_at }}。重传相同明细不会重复计入，内容不同则拒收。
+      </p>
+    {% else %}
+      <p class="muted">尚未收到本期明细。</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card">
+  <h1>截至第 {{ period_no }} 期的累计 B 分布</h1>
+  <div class="stats">
+    <div><span class="label">期望累计 B</span><span class="value">{{ summary.mean | expected }}</span></div>
+    <div><span class="label">标准差</span><span class="value">{{ summary.sd | expected }}</span></div>
+    <div><span class="label">众数</span><span class="value">{{ summary.mode }}</span></div>
+    <div><span class="label">95% 区间</span><span class="value">{{ summary.ci_low }}–{{ summary.ci_high }}</span></div>
+    <div><span class="label">支撑</span><span class="value">0–{{ summary.support_max }}</span></div>
+  </div>
+
+  {% if result %}
+    <div class="banner {% if result.flagged %}flag{% else %}ok{% endif %}">
+      实测累计 B = <strong>{{ result.observed_b }}</strong>，
+      下尾 P(X ≤ 实测) = {{ result.tail_low | sci }}，
+      上尾 P(X ≥ 实测) = {{ result.tail_high | sci }}，
+      p = 2 × min = <strong>{{ result.p_value | prob }}</strong>；
+      阈值 0.05 / {{ state.periods }} = {{ result.threshold | prob }}，
+      {% if result.flagged %}低于阈值，标记为异常。{% else %}未低于阈值。{% endif %}
+    </div>
+    <p class="muted">核验时间 {{ result.verified_at }}；累计已核验 {{ result.verified_users }} 人。</p>
+  {% else %}
+    <div class="banner pending">本期尚未纳入核验（需从第 1 期起连续到齐）。</div>
+  {% endif %}
+
+  <figure class="hist">
+    <figcaption>累计 B 人数分布（每柱约 {{ histogram[0].end - histogram[0].start + 1 if histogram else 0 }} 个取值）</figcaption>
+    <div class="hist-chart">
+      {% for bar in histogram %}
+        <div class="bar-wrap" title="{{ bar.start }}–{{ bar.end }}：{{ bar.mass }}">
+          <div class="bar" style="height: {{ (bar.height * 100) | round(1) }}%"></div>
+          <span class="tick">{{ bar.start }}</span>
+        </div>
+      {% endfor %}
+    </div>
+  </figure>
+
+  <h2>分位数</h2>
+  <table class="grid narrow">
+    <thead><tr><th>分位</th><th>累计 B 人数</th></tr></thead>
+    <tbody>
+      {% for q, value in quantiles %}
+        <tr><td>{{ q }}</td><td class="num">{{ value }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

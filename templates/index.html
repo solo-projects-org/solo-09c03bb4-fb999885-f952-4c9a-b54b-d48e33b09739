@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}总览 · 分期分流核验{% endblock %}
+{% block content %}
+{% if not state.configured %}
+  <section class="card">
+    <h1>尚未配置本轮</h1>
+    <p>先固定各期应到人数与每人分到 B 组的独立概率，再按期上传明细。</p>
+    <a class="button" href="{{ url_for('plan') }}">设置计划</a>
+  </section>
+{% else %}
+  <section class="card">
+    <div class="row">
+      <div>
+        <h1>本轮核验</h1>
+        <p class="muted">
+          共 {{ state.periods }} 期、计划合计 {{ state.plan | sum(attribute='planned_users') }} 人；
+          显著性阈值 0.05 / {{ state.periods }} = <strong>{{ state.threshold | prob }}</strong>。
+        </p>
+      </div>
+      <div class="actions">
+        <a class="button secondary" href="{{ url_for('plan') }}">查看计划</a>
+      </div>
+    </div>
+
+    {% if state.earliest_flag %}
+      <div class="banner flag">
+        最早触发分流异常的期次：<strong>第 {{ state.earliest_flag }} 期</strong>
+        （p = {{ state.results[state.earliest_flag].p_value | prob }} ≤ {{ state.threshold | prob }}）。
+      </div>
+    {% elif state.results %}
+      <div class="banner ok">截至目前没有期次的 p 值低于阈值。</div>
+    {% elif state.uploads %}
+      <div class="banner pending">已有上传，但第 1 期起尚未连续到齐，暂不核验。</div>
+    {% else %}
+      <div class="banner pending">尚未收到任何期次的明细。</div>
+    {% endif %}
+
+    <table class="grid">
+      <thead>
+        <tr>
+          <th>期次</th>
+          <th>计划人数</th>
+          <th>B 组概率</th>
+          <th>实收</th>
+          <th>本期 B 组</th>
+          <th>累计 B</th>
+          <th>期望累计 B</th>
+          <th>p 值</th>
+          <th>阈值</th>
+          <th>状态</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in state.plan %}
+          {% set period_no = row.period %}
+          {% set upload = state.uploads.get(period_no) %}
+          {% set result = state.results.get(period_no) %}
+          <tr class="{% if result and result.flagged %}flagged{% endif %}">
+            <td><a href="{{ url_for('period_detail', period_no=period_no) }}">第 {{ period_no }} 期</a></td>
+            <td class="num">{{ row.planned_users }}</td>
+            <td class="num">{{ row.prob_b | prob }}</td>
+            <td class="num">{{ upload.row_count if upload else '—' }}</td>
+            <td class="num">{{ upload.b_count if upload else '—' }}</td>
+            <td class="num">{{ result.observed_b if result else '—' }}</td>
+            <td class="num">{{ result.expected_b | expected if result else '—' }}</td>
+            <td class="num"><strong>{{ result.p_value | prob if result else '—' }}</strong></td>
+            <td class="num">{{ result.threshold | prob if result else state.threshold | prob }}</td>
+            <td>
+              {% if result %}
+                {% if result.flagged %}
+                  <span class="tag bad">异常</span>
+                {% else %}
+                  <span class="tag good">正常</span>
+                {% endif %}
+              {% elif upload %}
+                <span class="tag wait">待连续到齐</span>
+              {% else %}
+                <span class="tag wait">缺报</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% if state.pending %}
+      <p class="muted">
+        已收到但未核验的期次：{{ state.pending | join('、') }}。
+        只有从第 1 期起连续到齐的期次才会核验；缺口补齐后自动按计划顺序推进。
+      </p>
+    {% endif %}
+  </section>
+
+  {% if latest %}
+    <section class="card">
+      <h1>截至第 {{ latest.period }} 期</h1>
+      <div class="stats">
+        <div><span class="label">累计实测 B</span><span class="value">{{ latest.observed_b }}</span></div>
+        <div><span class="label">累计期望 B</span><span class="value">{{ latest.expected_b | expected }}</span></div>
+        <div><span class="label">标准差</span><span class="value">{{ latest_stats.sd | expected }}</span></div>
+        <div><span class="label">p 值</span><span class="value">{{ latest.p_value | prob }}</span></div>
+        <div><span class="label">95% 区间</span><span class="value">{{ latest_stats.ci_low }}–{{ latest_stats.ci_high }}</span></div>
+      </div>
+      <p class="muted">
+        p 值取两侧尾概率中较小者的两倍（含实测值），上限 1；累积分布为各期独立二项分布的卷积。
+      </p>
+      <a class="button secondary" href="{{ url_for('period_detail', period_no=latest.period) }}">查看第 {{ latest.period }} 期分布</a>
+    </section>
+  {% endif %}
+{% endif %}
+{% endblock %}
