@@ -33,6 +33,16 @@
 
 <section class="card">
   <h1>截至第 {{ period_no }} 期的累计 B 分布</h1>
+  <p class="muted">
+    分布计算：{{ distribution_lookup.label }}
+    {% if distribution_lookup.mode == "reuse" %}
+      （截至本期的计划人数按 B 组概率汇总与缓存一致，未重新卷积。）
+    {% elif distribution_lookup.mode == "resume" %}
+      （仅补算第 {{ distribution_lookup.resumed_from + 1 }}–{{ period_no }} 期。）
+    {% else %}
+      （缓存无可用前缀，已按计划从头卷积并写入缓存。）
+    {% endif %}
+  </p>
   <div class="stats">
     <div><span class="label">期望累计 B</span><span class="value">{{ summary.mean | expected }}</span></div>
     <div><span class="label">标准差</span><span class="value">{{ summary.sd | expected }}</span></div>

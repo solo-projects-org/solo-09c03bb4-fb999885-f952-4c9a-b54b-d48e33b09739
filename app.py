@@ -19,13 +19,15 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import os
 import random
 import sqlite3
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
-from functools import lru_cache
 from typing import Optional, Sequence
 
 from flask import (
@@ -115,6 +117,16 @@ CREATE TABLE IF NOT EXISTS results (
     flagged        INTEGER NOT NULL CHECK (flagged IN (0, 1)),
     verified_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+-- Completed cumulative-B distributions, keyed by the aggregate plan summary
+-- they were built from.  Shared by every worker process through the database
+-- so a restart (or another round that splits the same headcounts the same way)
+-- can reuse them.  The cap is enforced in ``persist_distribution_cache``.
+CREATE TABLE IF NOT EXISTS distribution_cache (
+    summary      TEXT PRIMARY KEY,
+    distribution TEXT NOT NULL,
+    last_used    REAL NOT NULL
+);
 """
 
 
@@ -198,19 +210,244 @@ def load_plan(db: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(db.execute("SELECT period, planned_users, prob_b FROM plan ORDER BY period"))
 
 
-def plan_key(plan: Sequence[sqlite3.Row]) -> tuple[tuple[int, str], ...]:
-    return tuple((int(row["planned_users"]), str(row["prob_b"])) for row in plan)
+def plan_pairs(plan: Sequence[sqlite3.Row]) -> list[tuple[int, Decimal]]:
+    return [(int(row["planned_users"]), Decimal(str(row["prob_b"]))) for row in plan]
 
 
-@lru_cache(maxsize=16)
-def cached_distributions(key: tuple[tuple[int, str], ...]):
-    return stats.all_prefix_distributions(
-        [(n, Decimal(p)) for n, p in key]
+# ---------------------------------------------------------------------------
+# Shared cumulative-B distribution cache
+# ---------------------------------------------------------------------------
+#
+# A cumulative distribution up to some period depends on the plan only through
+# the total planned headcount for each distinct group-B probability in that
+# prefix.  Re-splitting the same proportions into different periods, reordering
+# the periods or starting a new round with the same proportions therefore
+# yields the same distribution and can reuse a cached one.
+#
+# The cache is an LRU of complete distributions (at most
+# ``DISTRIBUTION_CACHE_LIMIT``).  A small in-process LRU mirrors it for fast
+# access, while the ``distribution_cache`` table is shared by every worker
+# process and survives a restart.
+
+DISTRIBUTION_CACHE_LIMIT = 16
+
+_memory_cache: "OrderedDict[str, tuple[Decimal, ...]]" = OrderedDict()
+_memory_lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class DistributionLookup:
+    """One cumulative distribution plus how it was obtained."""
+
+    distribution: tuple[Decimal, ...]
+    mode: str  # "reuse" | "resume" | "fresh"
+    resumed_from: Optional[int] = None
+
+    @property
+    def label(self) -> str:
+        if self.mode == "reuse":
+            return "直接复用缓存（截至本期的计划汇总与缓存一致）。"
+        if self.mode == "resume":
+            return f"目标期未命中缓存，从第 {self.resumed_from} 期已缓存的分布续算。"
+        return "缓存中没有可用分布，本次从头计算并写入缓存。"
+
+
+def plan_aggregate(
+    plan: Sequence[sqlite3.Row], target: int
+) -> tuple[tuple[Decimal, int], ...]:
+    """Planned headcounts of periods ``1..target`` grouped by B probability.
+
+    This is the cache identity: period boundaries and ordering do not matter,
+    only how many planned users carry each probability.
+    """
+    totals: dict[Decimal, int] = {}
+    for row in plan[:target]:
+        probability = Decimal(str(row["prob_b"]))
+        totals[probability] = totals.get(probability, 0) + int(row["planned_users"])
+    return tuple((probability, totals[probability]) for probability in sorted(totals))
+
+
+def _cache_key(summary: Sequence[tuple[Decimal, int]]) -> str:
+    return json.dumps(
+        [[stats.canonical_probability(probability), count] for probability, count in summary],
+        separators=(",", ":"),
     )
 
 
-def plan_distributions(plan: Sequence[sqlite3.Row]):
-    return cached_distributions(plan_key(plan))
+def _memory_get(key: str) -> Optional[tuple[Decimal, ...]]:
+    with _memory_lock:
+        distribution = _memory_cache.get(key)
+        if distribution is not None:
+            _memory_cache.move_to_end(key)
+        return distribution
+
+
+def _memory_put(key: str, distribution: tuple[Decimal, ...]) -> None:
+    with _memory_lock:
+        _memory_cache[key] = distribution
+        _memory_cache.move_to_end(key)
+        while len(_memory_cache) > DISTRIBUTION_CACHE_LIMIT:
+            _memory_cache.popitem(last=False)
+
+
+def _serialise_distribution(distribution: Sequence[Decimal]) -> str:
+    return json.dumps([str(value) for value in distribution], separators=(",", ":"))
+
+
+def _deserialise_distribution(text: str) -> tuple[Decimal, ...]:
+    return tuple(Decimal(value) for value in json.loads(text))
+
+
+def load_cached_distribution(
+    db: sqlite3.Connection, summary: Sequence[tuple[Decimal, int]]
+) -> Optional[tuple[Decimal, ...]]:
+    """Return a cached complete distribution for ``summary``, if any."""
+    key = _cache_key(summary)
+    distribution = _memory_get(key)
+    if distribution is not None:
+        return distribution
+    try:
+        row = db.execute(
+            "SELECT distribution FROM distribution_cache WHERE summary = ?", (key,)
+        ).fetchone()
+    except sqlite3.Error:
+        # Cache trouble must never prevent a distribution from being served.
+        return None
+    if row is None:
+        return None
+    try:
+        distribution = _deserialise_distribution(row["distribution"])
+    except (InvalidOperation, TypeError, ValueError):
+        # A damaged row is treated as a miss; a later computation replaces it.
+        return None
+    if not distribution or sum(distribution) <= 0:
+        return None
+    _memory_put(key, distribution)
+    return distribution
+
+
+def persist_distribution_cache(
+    entries: Sequence[tuple[tuple[tuple[Decimal, int], ...], tuple[Decimal, ...]]],
+    connection: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Best-effort persistence of newly computed distributions.
+
+    With ``connection`` the rows join the caller's transaction (used during
+    verification).  Otherwise a short-lived connection is used, so a display
+    request never blocks behind an upload's write lock.  A cache failure never
+    affects uploads, rosters or verification results.
+    """
+    if not entries:
+        return
+    owns_connection = connection is None
+    if owns_connection:
+        try:
+            connection = sqlite3.connect(
+                current_app.config["DB_PATH"], timeout=1, isolation_level=None
+            )
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error:
+            if connection is not None:
+                connection.close()
+            return
+    try:
+        if not owns_connection:
+            # The caller is verifying inside its own write transaction.  A
+            # savepoint keeps a cache-only failure from poisoning that
+            # transaction, so uploads and results are unaffected.
+            connection.execute("SAVEPOINT distribution_cache_write")
+        for summary, distribution in entries:
+            connection.execute(
+                "INSERT INTO distribution_cache (summary, distribution, last_used) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(summary) DO UPDATE SET "
+                "distribution = excluded.distribution, last_used = excluded.last_used",
+                (
+                    _cache_key(summary),
+                    _serialise_distribution(distribution),
+                    time.time(),
+                ),
+            )
+        connection.execute(
+            "DELETE FROM distribution_cache WHERE summary NOT IN ("
+            "SELECT summary FROM distribution_cache ORDER BY last_used DESC, summary LIMIT ?"
+            ")",
+            (DISTRIBUTION_CACHE_LIMIT,),
+        )
+        if owns_connection:
+            connection.execute("COMMIT")
+        else:
+            connection.execute("RELEASE distribution_cache_write")
+    except Exception:
+        # Cache persistence is opportunistic: never let it fail an upload,
+        # verification or display.  In a caller's transaction the savepoint
+        # rollback undoes any partial cache rows only.
+        if owns_connection:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        else:
+            try:
+                connection.execute("ROLLBACK TO distribution_cache_write")
+                connection.execute("RELEASE distribution_cache_write")
+            except sqlite3.Error:
+                pass
+    finally:
+        if owns_connection:
+            connection.close()
+
+
+def _extend_distribution(
+    distribution: tuple[Decimal, ...], period: tuple[int, Decimal]
+) -> tuple[Decimal, ...]:
+    planned_users, probability = period
+    return stats.convolve(distribution, stats.binomial_pmf(planned_users, probability))
+
+
+def distribution_for_target(
+    db: sqlite3.Connection,
+    plan: Sequence[sqlite3.Row],
+    target: int,
+    *,
+    in_transaction: bool = False,
+) -> DistributionLookup:
+    """Distribution for periods ``1..target``, reusing or resuming if possible.
+
+    The target's own aggregate is checked first (direct reuse).  On a miss the
+    nearest earlier prefix with a cached distribution is used as the starting
+    point, so only the remaining periods are convolved.
+    """
+    if not 1 <= target <= len(plan):
+        raise ValueError("target period is outside the plan")
+    summaries = [plan_aggregate(plan, period) for period in range(1, target + 1)]
+    periods = plan_pairs(plan)
+    cache_connection = db if in_transaction else None
+
+    for prefix in range(target, 0, -1):
+        cached = load_cached_distribution(db, summaries[prefix - 1])
+        if cached is None:
+            continue
+        if prefix == target:
+            return DistributionLookup(cached, "reuse", prefix)
+        distribution = cached
+        entries = []
+        for index in range(prefix, target):
+            distribution = _extend_distribution(distribution, periods[index])
+            entries.append((summaries[index], distribution))
+        for summary, computed in entries:
+            _memory_put(_cache_key(summary), computed)
+        persist_distribution_cache(entries, cache_connection)
+        return DistributionLookup(distribution, "resume", prefix)
+
+    distributions = stats.prefix_distributions(periods, target)
+    entries = [
+        (summaries[index], distributions[index]) for index in range(target)
+    ]
+    for summary, computed in entries:
+        _memory_put(_cache_key(summary), computed)
+    persist_distribution_cache(entries, cache_connection)
+    return DistributionLookup(distributions[-1], "fresh")
 
 
 def verification_threshold(periods: int) -> Decimal:
@@ -393,6 +630,10 @@ def recompute_results(db: sqlite3.Connection) -> list[int]:
 
     Must be called inside the caller's write transaction.  Results are
     deleted and re-inserted so a period never has more than one row.
+
+    Only the periods needed for the contiguous prefix are examined.  A later
+    upload that does not yet close the gap is stored but kept waiting, so no
+    distribution beyond the last verifiable period is computed.
     """
     plan = load_plan(db)
     periods = round_periods(db) or len(plan)
@@ -400,7 +641,6 @@ def recompute_results(db: sqlite3.Connection) -> list[int]:
         db.execute("DELETE FROM results")
         return []
 
-    distributions = plan_distributions(plan)
     threshold = verification_threshold(periods)
 
     db.execute("DELETE FROM results")
@@ -417,7 +657,10 @@ def recompute_results(db: sqlite3.Connection) -> list[int]:
 
         cum_users += int(upload["row_count"])
         cum_b += int(upload["b_count"])
-        distribution = distributions[index]
+        lookup = distribution_for_target(
+            db, plan, index + 1, in_transaction=True
+        )
+        distribution = lookup.distribution
         p_value = stats.two_sided_p_value(distribution, cum_b)
         tail_low, tail_high = stats.tail_probabilities(distribution, cum_b)
         expected_b = sum(
@@ -537,7 +780,23 @@ def store_upload(period: int, parsed: ParsedUpload) -> UploadOutcome:
                 "INSERT INTO assignments (user_id, period, grp) VALUES (?, ?, ?)",
                 [(row.user_id, period, row.group) for row in parsed.rows],
             )
-            verified = recompute_results(db)
+            try:
+                verified = recompute_results(db)
+            except sqlite3.OperationalError:
+                # Lock contention: let the outer retry loop handle it.
+                raise
+            except Exception:
+                # A distribution/verification failure must not leave a
+                # half-written period behind: roll back this upload only.
+                # Previously accepted rosters and results stay untouched and
+                # the same submission can simply be uploaded again.
+                current_app.logger.exception("verification computation failed")
+                _rollback(db)
+                return UploadOutcome(
+                    "error",
+                    f"第 {period} 期明细已解析，但核验计算失败，本次未计入；"
+                    "已收名单和核验结果保持不变，请稍后重新上传。",
+                )
             db.execute("COMMIT")
             suffix = (
                 f"连续核验到第 {verified[-1]} 期。"
@@ -615,10 +874,9 @@ def index():
         latest_period = verified[-1]
         result = state["results"][latest_period]
         plan = state["plan"]
-        distributions = plan_distributions(plan)
-        distribution = distributions[latest_period - 1]
+        lookup = distribution_for_target(db, plan, latest_period)
         latest_stats = stats.distribution_stats(
-            distribution,
+            lookup.distribution,
             Decimal(result["expected_b"]),
             Decimal(result["variance"]),
         )
@@ -794,8 +1052,8 @@ def period_detail(period_no: int):
     upload_row = state["uploads"].get(period_no)
     result_row = state["results"].get(period_no)
     plan = state["plan"]
-    distributions = plan_distributions(plan)
-    distribution = distributions[period_no - 1]
+    lookup = distribution_for_target(db, plan, period_no)
+    distribution = lookup.distribution
     expected_b = sum(
         Decimal(str(plan[i]["planned_users"])) * Decimal(str(plan[i]["prob_b"]))
         for i in range(period_no)
@@ -846,6 +1104,7 @@ def period_detail(period_no: int):
         quantiles=quantiles,
         histogram=histogram,
         distribution=distribution,
+        distribution_lookup=lookup,
     )
 
 
@@ -857,8 +1116,8 @@ def period_api(period_no: int):
     if not state["configured"] or not 1 <= period_no <= state["periods"]:
         abort(404)
     plan = state["plan"]
-    distributions = plan_distributions(plan)
-    distribution = distributions[period_no - 1]
+    lookup = distribution_for_target(db, plan, period_no)
+    distribution = lookup.distribution
     result = state["results"].get(period_no)
     payload = {
         "period": period_no,

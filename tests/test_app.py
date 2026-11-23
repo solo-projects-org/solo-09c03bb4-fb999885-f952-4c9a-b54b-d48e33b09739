@@ -34,8 +34,10 @@ def client(tmp_path):
         SECRET_KEY="test-secret",
     )
     app_module.bootstrap(db_path)
+    app_module._memory_cache.clear()
     with application.test_client() as test_client:
         yield test_client
+    app_module._memory_cache.clear()
     app_module._schema_ready_paths.discard(db_path)
 
 
@@ -489,3 +491,198 @@ def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Shared distribution cache
+# ---------------------------------------------------------------------------
+
+
+def cache_rows(application):
+    return fetch(application, "SELECT summary, distribution FROM distribution_cache ORDER BY summary")
+
+
+def period_page(client, period):
+    return client.get(f"/period/{period}").get_data(as_text=True)
+
+
+def clear_caches(application):
+    app_module._memory_cache.clear()
+    conn = sqlite3.connect(application.config["DB_PATH"])
+    try:
+        conn.execute("DELETE FROM distribution_cache")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_distribution_is_reused_when_aggregate_matches(client):
+    clear_caches(app_module.app)
+    configure(client, [250, 250, 250, 250], ["0.5"] * 4)
+    upload(client, 1, rows_for(1, 250, 120))
+    # Period 1 is computed fresh during verification and then reused for display.
+    assert "直接复用缓存" in period_page(client, 1)
+    # Period 2 has a new aggregate; it resumes from period 1 rather than
+    # recomputing the whole prefix, and caches the distributions it computed.
+    assert "从第 1 期已缓存的分布续算" in period_page(client, 2)
+    # Each view resumes from the closest cached prefix and caches the rest;
+    # a repeat view of the same target is then a direct reuse.
+    assert "从第 2 期已缓存的分布续算" in period_page(client, 3)
+    assert "从第 3 期已缓存的分布续算" in period_page(client, 4)
+    assert "直接复用缓存" in period_page(client, 4)
+    assert "从头计算" not in period_page(client, 1)
+
+
+def test_resume_from_nearest_available_prefix(client):
+    configure(client, [200, 300, 500], ["0.5", "0.4", "0.6"])
+    upload(client, 1, rows_for(1, 200, 100))
+    upload(client, 2, rows_for(2, 300, 120))
+    clear_caches(app_module.app)
+    # Fresh process/restart: nothing cached, so the first view computes from
+    # scratch and the next view resumes from it.
+    assert "从头计算" in period_page(client, 2)
+    text = period_page(client, 3)
+    assert "从第 2 期已缓存的分布续算" in text
+    assert "仅补算第 3–3 期" in text
+
+
+def test_splitting_same_proportions_reuses_distribution(client):
+    configure(client, [500, 500], ["0.5", "0.5"])
+    upload(client, 1, rows_for(1, 500, 250))
+    # Distribution for 500 users at 0.5 (the old period-1 prefix).
+    old_prefix = [Decimal(v) for v in client.get("/api/period/1").get_json()["distribution"]]
+    assert len(old_prefix) == 501
+    client.post("/round/reset", data={"confirm": "RESET"}, follow_redirects=True)
+
+    # Same 1000 users at 0.5, now split into four periods.  Period 2's
+    # aggregate (500 users at 0.5) matches the old period-1 prefix, so the
+    # cached distribution is reused verbatim.
+    configure(client, [250, 250, 250, 250], ["0.5"] * 4)
+    assert "直接复用缓存" in period_page(client, 2)
+    split = [Decimal(v) for v in client.get("/api/period/2").get_json()["distribution"]]
+    assert len(split) == 501
+    assert split == old_prefix
+    direct = stats.binomial_pmf(500, Decimal("0.5"))
+    assert max(abs(a - b) for a, b in zip(split, direct)) < Decimal("1e-40")
+
+
+def test_reordering_periods_keeps_aggregate_cache(client):
+    configure(client, [400, 600], ["0.5", "0.5"])
+    upload(client, 1, rows_for(1, 400, 200))
+    client.post("/round/reset", data={"confirm": "RESET"}, follow_redirects=True)
+    # Reordered/different period sizes with the same per-period probabilities
+    # map onto the same cumulative headcounts for the first period only if the
+    # aggregate matches; period 1 is 400 again here.
+    configure(client, [400, 200, 400], ["0.5"] * 3)
+    assert "直接复用缓存" in period_page(client, 1)
+
+
+def test_cache_survives_restart_and_is_capped(tmp_path):
+    db_path = str(tmp_path / "restart.sqlite3")
+    application = app_module.app
+    application.config.update(TESTING=True, DB_PATH=db_path)
+    app_module.bootstrap(db_path)
+    app_module._memory_cache.clear()
+
+    with application.test_client() as test_client:
+        configure(test_client, [500, 500], ["0.5", "0.5"])
+        upload(test_client, 1, rows_for(1, 500, 250))
+        assert len(cache_rows(application)) >= 1
+
+    # Simulate a service restart: only the database survives.
+    app_module._memory_cache.clear()
+    with application.test_client() as test_client:
+        assert "直接复用缓存" in period_page(test_client, 1)
+
+    # The shared cap is 16 complete distributions.
+    with application.test_client() as test_client:
+        for index in range(20):
+            probability = Decimal(1 + index) / Decimal(100)
+            client_rows = [
+                (f"cap{index}-{i}", "B" if i < 10 else "A") for i in range(200)
+            ]
+            test_client.post("/round/reset", data={"confirm": "RESET"}, follow_redirects=True)
+            configure(test_client, [200, 800], [str(probability), "0.5"])
+            upload(test_client, 1, client_rows)
+            # Each view also persists the full prefix it displays.
+            period_page(test_client, 2)
+            assert len(cache_rows(application)) <= 16
+    app_module._schema_ready_paths.discard(db_path)
+
+
+def test_verification_only_computes_through_the_gap(client, monkeypatch):
+    configure(client, [250, 250, 250, 250], ["0.5"] * 4)
+    upload(client, 1, rows_for(1, 250, 120))
+    upload(client, 3, rows_for(3, 250, 120))
+    upload(client, 4, rows_for(4, 250, 120))
+
+    computed = []
+    original = stats.prefix_distributions
+
+    def tracking(plan, target, *args, **kwargs):
+        computed.append(target)
+        return original(plan, target, *args, **kwargs)
+
+    monkeypatch.setattr(stats, "prefix_distributions", tracking)
+    clear_caches(app_module.app)
+    upload(client, 2, rows_for(2, 250, 120))
+    # Period 1's distribution is recomputed (cache cleared), then only the
+    # next contiguous period extends it; period 3/4 sizes never trigger a
+    # from-scratch computation beyond the contiguous prefix.
+    assert computed and computed[0] == 1
+    assert max(computed) <= 2
+    results = fetch(app_module.app, "SELECT period FROM results ORDER BY period")
+    assert [r["period"] for r in results] == [1, 2, 3, 4]
+
+
+def test_threshold_uses_planned_period_count(client):
+    configure(client, [500, 250, 250], ["0.5", "0.5", "0.5"])
+    upload(client, 1, rows_for(1, 500, 500))
+    result = fetch(app_module.app, "SELECT * FROM results WHERE period = 1")[0]
+    # 0.05 / planned periods (3), not the widest verified prefix (1).
+    assert Decimal(result["threshold"]) == app_module.verification_threshold(3)
+    assert "0.0166667" in period_page(client, 1)
+
+
+def test_distribution_failure_keeps_rosters_and_allows_reupload(client, monkeypatch):
+    configure(client, [200, 800], ["0.5", "0.5"])
+    upload(client, 1, rows_for(1, 200, 100))
+    before = fetch(app_module.app, "SELECT * FROM results")
+
+    original = stats.prefix_distributions
+    calls = {"n": 0}
+
+    def boom(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated distribution failure")
+        # Later calls (e.g. the redirect's display) work again.
+        return original(*args, **kwargs)
+
+    # Force a computation (not a cache hit) for the new period.
+    clear_caches(app_module.app)
+    monkeypatch.setattr(stats, "prefix_distributions", boom)
+    resp = upload(client, 2, rows_for(2, 800, 400))
+    assert "核验计算失败" in resp.get_data(as_text=True)
+    # The failed period is not stored and prior results are intact.
+    assert len(fetch(app_module.app, "SELECT * FROM uploads")) == 1
+    after = fetch(app_module.app, "SELECT * FROM results")
+    assert [r["observed_b"] for r in after] == [r["observed_b"] for r in before]
+
+    # The same submission succeeds once computation recovers.
+    resp = upload(client, 2, rows_for(2, 800, 400))
+    assert "已接收" in resp.get_data(as_text=True)
+    assert [r["period"] for r in fetch(app_module.app, "SELECT period FROM results ORDER BY period")] == [1, 2]
+
+
+def test_cache_write_failure_does_not_break_upload(client, monkeypatch):
+    configure(client, [300, 700], ["0.5", "0.5"])
+
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError("cache unavailable")
+
+    monkeypatch.setattr(app_module, "_serialise_distribution", broken)
+    resp = upload(client, 1, rows_for(1, 300, 150))
+    assert "已接收" in resp.get_data(as_text=True)
+    assert len(fetch(app_module.app, "SELECT * FROM results")) == 1
+    assert fetch(app_module.app, "SELECT COUNT(*) c FROM assignments")[0]["c"] == 300

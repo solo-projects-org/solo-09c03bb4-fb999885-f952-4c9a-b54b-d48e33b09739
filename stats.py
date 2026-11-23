@@ -66,22 +66,53 @@ def convolve(a: Sequence[Decimal], b: Sequence[Decimal]) -> tuple[Decimal, ...]:
         return tuple(out)
 
 
+def prefix_distributions(
+    plan: Sequence[tuple[int, Decimal]],
+    target: int,
+    start: int = 0,
+    base: Sequence[Decimal] = (ONE,),
+) -> tuple[tuple[Decimal, ...], ...]:
+    """Cumulative-B null distributions for prefixes up to ``target``.
+
+    ``plan`` is a sequence of ``(planned_users, prob_b)`` in period order.
+    Only periods ``1..target`` are needed: a gap must never force work on
+    later periods.  ``start`` (with ``base``) allows continuing from an
+    already-computed prefix instead of convolving from the first period, so
+    the returned tuple holds the distributions for prefixes
+    ``start+1 .. target``.
+
+    Combining periods that share a probability is mathematically the same as
+    convolving their individual binomials, so the distribution for a prefix
+    depends only on the planned headcounts grouped by B probability.
+    """
+    if target < 1:
+        raise ValueError("target must be at least 1")
+    if target > len(plan):
+        raise ValueError("target exceeds the number of planned periods")
+    if not 0 <= start < target:
+        raise ValueError("start must be in [0, target)")
+    if len(base) != 1 + sum(n for n, _ in plan[:start]):
+        raise ValueError("base distribution does not match the completed prefix")
+
+    result: list[tuple[Decimal, ...]] = []
+    dist: tuple[Decimal, ...] = tuple(base)
+    for n, p in plan[start:target]:
+        dist = convolve(dist, binomial_pmf(n, p))
+        result.append(dist)
+    return tuple(result)
+
+
 def all_prefix_distributions(
     plan: Sequence[tuple[int, Decimal]],
 ) -> tuple[tuple[Decimal, ...], ...]:
     """Cumulative-B null distributions for every prefix of the plan.
 
-    ``plan`` is a sequence of ``(planned_users, prob_b)`` in period order.
     Element ``k`` of the result is the distribution of the cumulative number
-    of B users over periods 1..k+1, i.e. a convolution of the corresponding
-    independent binomials.
+    of B users over periods 1..k+1.
     """
-    result: list[tuple[Decimal, ...]] = []
-    dist: tuple[Decimal, ...] = (ONE,)
-    for n, p in plan:
-        dist = convolve(dist, binomial_pmf(n, p))
-        result.append(dist)
-    return tuple(result)
+    if not plan:
+        return ()
+    return prefix_distributions(plan, len(plan))
 
 
 def two_sided_p_value(distribution: Sequence[Decimal], observed: int) -> Decimal:
